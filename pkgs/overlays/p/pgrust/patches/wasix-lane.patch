@@ -1,0 +1,1266 @@
+diff --git a/crates/backend/libpq/pqcomm/src/socket.rs b/crates/backend/libpq/pqcomm/src/socket.rs
+index 916f10b0ba..35462cf2b6 100644
+--- a/crates/backend/libpq/pqcomm/src/socket.rs
++++ b/crates/backend/libpq/pqcomm/src/socket.rs
+@@ -415,6 +415,25 @@ pub fn ListenServerPort(
+                 .finish(loc("ListenServerPort"))?;
+         }
+ 
++        // A blocking listener is correct here and nowhere else is it load-bearing,
++        // so this is scoped to the one platform where it costs the accept loop its
++        // queue: WASIX parks an empty-queue accept() for a 30 s timeout it invents
++        // itself (errno ETIMEDOUT, not EWOULDBLOCK), and a parked accept consumes
++        // the readiness the epoll watch still owes the rest of an arrival burst.
++        // Non-blocking gives the EAGAIN at 0 ms that `drain_end` below, and the
++        // drain in postmaster's ServerLoop, are written to terminate on. Set before
++        // ConfigurePostmasterWaitSet registers the fd, as the measured fix requires.
++        if cfg!(all(target_family = "wasm", target_vendor = "wasmer")) {
++            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
++            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
++            {
++                ereport(FATAL)
++                    .with_saved_errno(errno())
++                    .errmsg("could not set listening socket to nonblocking mode: %m")
++                    .finish(loc("ListenServerPort"))?;
++            }
++        }
++
+         // Without SO_REUSEADDR a new postmaster can't start right away after
+         // a stop or crash.
+         if addr.family != ip::sys::AF_UNIX
+@@ -640,14 +659,23 @@ pub fn AcceptConnection(server_fd: pgsocket, client_sock: &mut ClientSocket) ->
+     };
+     if fd == PGINVALID_SOCKET {
+         client_sock.sock = PGINVALID_SOCKET;
+-        let _ = ereport(LOG)
+-            .with_saved_errno(errno())
+-            .errcode_for_socket_access()
+-            .errmsg("could not accept new connection: %m")
+-            .finish(loc("AcceptConnection"));
++        // ServerLoop drains the accept queue to empty on WASIX, because there
++        // one epoll event stands for however many connections completed while
++        // the postmaster was busy (see serverloop.rs). The EWOULDBLOCK that
++        // ends a drain is the expected tail of the batch, not a spurious
++        // wakeup, so it must not cost a log line and a 100 ms delay per event.
++        let drain_end =
++            cfg!(all(target_family = "wasm", target_vendor = "wasmer")) && errno() == libc::EAGAIN;
++        if !drain_end {
++            let _ = ereport(LOG)
++                .with_saved_errno(errno())
++                .errcode_for_socket_access()
++                .errmsg("could not accept new connection: %m")
++                .finish(loc("AcceptConnection"));
+ 
+-        // The postmaster retries immediately on read-ready; delay a bit.
+-        std::thread::sleep(std::time::Duration::from_micros(100000));
++            // The postmaster retries immediately on read-ready; delay a bit.
++            std::thread::sleep(std::time::Duration::from_micros(100000));
++        }
+         return STATUS_ERROR;
+     }
+     client_sock.sock = fd;
+diff --git a/crates/backend/postmaster/launch_backend/src/lib.rs b/crates/backend/postmaster/launch_backend/src/lib.rs
+index c714f95f79..088c7e720d 100644
+--- a/crates/backend/postmaster/launch_backend/src/lib.rs
++++ b/crates/backend/postmaster/launch_backend/src/lib.rs
+@@ -814,6 +814,20 @@ pub fn postmaster_child_launch(
+         }
+     };
+ 
++    // C25: a child whose stack reservation no longer fits the guest's linear
++    // memory is refused here, before it costs a pid. The refusal cannot be
++    // handled later: the guest's only route to more memory is a grow that
++    // cannot be undone, and a refused grow ends in std's allocation-error hook
++    // aborting the postmaster and every session already served with it.
++    let stack_size = child_thread_stack_size();
++    #[cfg(target_arch = "wasm32")]
++    if linear_memory_refuses(stack_size) {
++        // The -1 contract is fork()'s, same as the two refusals below: the
++        // postmaster closes the client socket and reclaims the slot.
++        vfs::set_errno(libc::EAGAIN);
++        return -1;
++    }
++
+     let Some(child_pid) = reserve_child_pid() else {
+         // Synthetic pid space exhausted: refuse with the same -1 contract as a
+         // failed thread spawn (the postmaster closes the client socket and
+@@ -861,7 +875,7 @@ pub fn postmaster_child_launch(
+ 
+     let spawned = std::thread::Builder::new()
+         .name(format!("pg:{}:{}", kind.name, child_pid))
+-        .stack_size(child_thread_stack_size())
++        .stack_size(stack_size)
+         .spawn(move || {
+             // PERMIT-S1: bind this thread to its slot and park until the
+             // first permit grant. Declared FIRST so its Drop — the teardown
+@@ -891,7 +905,7 @@ pub fn postmaster_child_launch(
+ 
+             // C records the stack base once in main(); each thread owns its own.
+             let _ = stack_depth::set_stack_base();
+-            stack_depth::set_thread_stack_ceiling(child_thread_stack_size());
++            stack_depth::set_thread_stack_ceiling(stack_size);
+ 
+             let guc_result = if guc::layers::base_share_enabled() {
+                 guc::store::initialize_guc_options_for_child_base(&guc_base)
+@@ -959,6 +973,146 @@ fn child_thread_stack_size() -> usize {
+     computed.max(min_stack)
+ }
+ 
++// The guest-side half of the C25 refusal. Linear memory can only grow (the
++// linked libc builds its allocator without mmap backup and with trimming
++// disabled, and its sbrk aborts a negative increment), so the ceiling is a
++// one-way budget and `memory.size()` is already this process's high-water
++// mark: it counts every reservation handed out since boot, including those of
++// backends that have since exited. The default ceiling is the module's declared
++// imported-memory maximum, which for this artifact is also the bound the host
++// enforces — so no trial grow is needed to learn it, and none would be
++// possible: a probe that grows to test availability cannot give the pages back.
++// The margin is one further reservation while every reservation handed out is
++// still live: the measured cost per admitted backend exceeds the reservation
++// alone, and the refusal path renders its own log line, so the budget has to
++// still cover a whole child for the "no" to be answerable.
++// Once a child has exited the arithmetic changes. dlmalloc here has no mmap and
++// cannot trim, so `memory.size()` is the arena's high-water mark and never
++// falls, while the exited child's stack block does go back to the allocator's
++// free lists. Measured on this artifact: 150 sequential (connect, query, close)
++// clients cost ~4.8 pages each, because the next backend takes the previous
++// one's block, while 226 concurrently live ones cost ~270 each. A launch with
++// an exited child behind it therefore needs room only for its residue, and the
++// guard has to let it through -- otherwise one traffic spike retires the server
++// for the rest of the postmaster's life. PGRUST_WASM_MEM_CAP_PAGES re-sizes the
++// ceiling for an A/B against the same module; 0 disables the guard.
++#[cfg(target_arch = "wasm32")]
++fn linear_memory_refuses(reservation_bytes: usize) -> bool {
++    let ceiling_pages = std::env::var("PGRUST_WASM_MEM_CAP_PAGES")
++        .ok()
++        .and_then(|v| v.parse::<usize>().ok())
++        .unwrap_or(65_536);
++    // SAFETY: memory 0 is this module's own linear memory — the imported
++    // `env.memory` every allocation in the guest comes from.
++    let used_pages = unsafe { core::arch::wasm32::memory_size(0) } as usize;
++    let live = live_child_count();
++    let peak = PEAK_LIVE_CHILDREN.load(Ordering::Relaxed);
++    if linear_memory_refuses_at(used_pages, reservation_bytes, ceiling_pages, live, peak) {
++        return true;
++    }
++    PEAK_LIVE_CHILDREN.store(peak.max(live + 1), Ordering::Relaxed);
++    false
++}
++
++/// Entries leave `CHILD_THREADS` in `join_announced_child`, which is where a
++/// child's thread ends and its stack goes back to the allocator, so the length
++/// is the number of reservations currently held. A retention-parked worker keeps
++/// both its entry and its stack, so counting it errs toward refusing.
++#[cfg(target_arch = "wasm32")]
++fn live_child_count() -> usize {
++    CHILD_THREADS
++        .lock()
++        .unwrap_or_else(|e| e.into_inner())
++        .len()
++}
++
++#[cfg(target_arch = "wasm32")]
++static PEAK_LIVE_CHILDREN: std::sync::atomic::AtomicUsize =
++    std::sync::atomic::AtomicUsize::new(0);
++
++// The arithmetic alone, so the boundary is testable off the guest.
++#[cfg(any(test, target_arch = "wasm32"))]
++fn linear_memory_refuses_at(
++    used_pages: usize,
++    reservation_bytes: usize,
++    ceiling_pages: usize,
++    live_children: usize,
++    peak_children: usize,
++) -> bool {
++    if ceiling_pages == 0 {
++        return false;
++    }
++    const PAGE_BYTES: usize = 65_536;
++    let needed = reservation_bytes.div_ceil(PAGE_BYTES);
++    let free = ceiling_pages.saturating_sub(used_pages);
++    // A quarter reservation covers the residue of ~13 completed clients at the
++    // measured 4.8 pages each.
++    let room = if live_children < peak_children { needed / 4 } else { needed * 2 };
++    free < room
++}
++
++#[cfg(test)]
++mod linear_memory_tests {
++    use super::linear_memory_refuses_at;
++
++    const RESERVE: usize = 16 << 20;
++    const CEILING: usize = 65_536;
++    // Nobody has ever exited: the first climb, where every reservation is live.
++    const FRESH: (usize, usize) = (0, 0);
++
++    #[test]
++    fn admits_while_two_reservations_stay_free() {
++        // 4 751 pages of boot-time mapping, the measured postmaster baseline.
++        assert!(!linear_memory_refuses_at(4_751, RESERVE, CEILING, FRESH.0, FRESH.1));
++        // The last admission the arithmetic still allows: 65 536 - 512 = 65 024.
++        assert!(!linear_memory_refuses_at(65_024, RESERVE, CEILING, FRESH.0, FRESH.1));
++    }
++
++    #[test]
++    fn refuses_once_the_margin_is_eaten() {
++        // One page over that boundary admits a child and leaves the refusal
++        // path no room to say "no" to the next one.
++        assert!(linear_memory_refuses_at(65_025, RESERVE, CEILING, FRESH.0, FRESH.1));
++        // The measured wall: 65 298 pages used with 238 free could not have
++        // served a 256-page reservation whoever was refusing.
++        assert!(linear_memory_refuses_at(65_298, RESERVE, CEILING, FRESH.0, FRESH.1));
++    }
++
++    #[test]
++    fn a_reservation_rounds_up_to_whole_pages() {
++        // One byte of reservation still costs a page, 65 537 bytes cost two.
++        assert!(!linear_memory_refuses_at(65_534, 1, CEILING, FRESH.0, FRESH.1));
++        assert!(linear_memory_refuses_at(65_534, 65_537, CEILING, FRESH.0, FRESH.1));
++    }
++
++    #[test]
++    fn zero_ceiling_disables_the_guard() {
++        assert!(!linear_memory_refuses_at(usize::MAX, usize::MAX, 0, FRESH.0, FRESH.1));
++    }
++
++    #[test]
++    fn an_exited_child_lets_the_next_one_in_below_the_ceiling() {
++        // Leg 57d2's state: 65 298 pages mapped, 238 of the ceiling still
++        // unmapped, 206 of 226 children gone. The page-only guard refused here
++        // because 238 < 2*256; with exited children behind it the arena needs
++        // room only for the residue, so this admits.
++        assert!(!linear_memory_refuses_at(65_298, RESERVE, CEILING, 20, 226));
++        // The same reading with nobody gone is the first climb again, and refuses.
++        assert!(linear_memory_refuses_at(65_298, RESERVE, CEILING, 226, 226));
++        // Even with exits behind it, an arena exactly at its ceiling has no page
++        // left for the residue: the guard still says no, and that is the true
++        // wall rather than a conservatism this predicate can remove.
++        assert!(linear_memory_refuses_at(CEILING, RESERVE, CEILING, 20, 226));
++    }
++
++    #[test]
++    fn reuse_still_needs_room_for_the_residue() {
++        // Reuse pays for the stack but not for the backend's own heap delta.
++        assert!(linear_memory_refuses_at(CEILING - 63, RESERVE, CEILING, 1, 226));
++        assert!(!linear_memory_refuses_at(CEILING - 64, RESERVE, CEILING, 1, 226));
++    }
++}
++
+ pub fn init_seams() {
+     postmaster_seams::parallel_pool_dispatch::set(wpool::dispatch);
+     postmaster_seams::parallel_pool_retire_db::set(retire_db_all_pools);
+diff --git a/crates/backend/postmaster/memwatchdog/src/lib.rs b/crates/backend/postmaster/memwatchdog/src/lib.rs
+index 0bafbd0e97..c2dea5bd5a 100644
+--- a/crates/backend/postmaster/memwatchdog/src/lib.rs
++++ b/crates/backend/postmaster/memwatchdog/src/lib.rs
+@@ -11,7 +11,9 @@
+ //!
+ //! Mechanism: one postmaster-lifetime sampler thread ("pg:memwatchdog").
+ //! Every `pgrust.memory_watchdog_interval` (default 1s) it reads process
+-//! RSS (/proc/self/status; allocator stats off-Linux), the cgroup v2
++//! RSS (/proc/self/status; the allocator hook off-Linux; else the accounted
++//! context footprint — the WASIX guest, where neither kernel signal exists),
++//! the cgroup v2
+ //! `memory.current`/`memory.max` when present, the process-wide accounted
+ //! context block bytes (`mcx::global_footprint`), and the allocator's
+ //! committed bytes (installed hook, mimalloc `mi_process_info`). Against
+@@ -179,15 +181,27 @@ struct Ledger {
+     alloc: Option<AllocatorStats>,
+ }
+ 
++// The usage basis, as a pure function of the three signals `collect` gathers, so the
++// WASIX-guest arm is testable without a fake /proc: on Linux `/proc/self/status` wins,
++// off-Linux with the allocator hook installed that hook's process RSS does, and with
++// NEITHER — the guest, where the hook is `#[cfg(not(target_family = "wasm"))]` and the
++// proc file is absent — the process-wide accounted context footprint is the only memory
++// number the guest still produces. Pre-fix this last arm returned 0, which made `tick`
++// short-circuit on `usage == 0` and left the watchdog armed but structurally blind.
++fn usage_basis(pm: Option<&ProcMem>, alloc: Option<AllocatorStats>, footprint: usize) -> u64 {
++    match (pm, alloc) {
++        (Some(m), _) => m.rss_kb * 1024,
++        (None, Some(a)) => a.current_rss as u64,
++        (None, None) => footprint as u64,
++    }
++}
++
+ fn collect(limit_mb: i32) -> Ledger {
+     let pm = proc_status();
+     let cg = cgroup_mem();
+     let alloc = allocator_stats();
+-    let rss_bytes = match (pm, alloc) {
+-        (Some(m), _) => m.rss_kb * 1024,
+-        (None, Some(a)) => a.current_rss as u64,
+-        (None, None) => 0,
+-    };
++    let accounted = mcx::global_footprint::bytes();
++    let rss_bytes = usage_basis(pm.as_ref(), alloc, accounted);
+     let (usage, limit, source) = if limit_mb > 0 {
+         (rss_bytes, (limit_mb as u64) << 20, LimitSource::Guc)
+     } else if let Some((current, Some(max))) = cg {
+@@ -203,7 +217,7 @@ fn collect(limit_mb: i32) -> Ledger {
+         source,
+         pm,
+         cg,
+-        accounted: mcx::global_footprint::bytes(),
++        accounted,
+         alloc,
+     }
+ }
+@@ -453,4 +467,25 @@ mod tests {
+         assert_eq!(s.current_rss, 42);
+         assert_eq!(s.current_commit, 43);
+     }
++
++    #[test]
++    fn usage_basis_falls_through_proc_allocator_footprint() {
++        let p = ProcMem {
++            rss_kb: 100,
++            ..Default::default()
++        };
++        // /proc wins when present, regardless of the hook.
++        assert_eq!(usage_basis(Some(&p), None, 999), 100 * 1024);
++        // Off-Linux the allocator hook's process RSS is the basis.
++        assert_eq!(
++            usage_basis(None, Some(AllocatorStats { current_rss: 4096, ..Default::default() }), 7),
++            4096
++        );
++        // The WASIX guest: neither kernel signal exists, so the accounted context
++        // footprint is the usage basis (the number the guest's own memctx probe
++        // prints). Pre-fix this arm returned 0 and `tick` bailed on `usage == 0`,
++        // which is exactly the armed-and-blind reading pass 70 measured.
++        assert_eq!(usage_basis(None, None, 126_589_984), 126_589_984);
++        assert_eq!(usage_basis(None, None, 0), 0);
++    }
+ }
+diff --git a/crates/backend/postmaster/postmaster/src/main_entry.rs b/crates/backend/postmaster/postmaster/src/main_entry.rs
+index d2f92006ee..0426c05d4d 100644
+--- a/crates/backend/postmaster/postmaster/src/main_entry.rs
++++ b/crates/backend/postmaster/postmaster/src/main_entry.rs
+@@ -106,11 +106,55 @@ extern "C" fn c_handle_pm_pmsignal(sig: i32) {
+ }
+ extern "C" fn c_dummy_handler(_sig: i32) {}
+ 
+-// wasm32: WASI p1 delivers no signals; the postmaster's process-signal
+-// installs are no-ops (the postmaster is unreachable on wasm anyway —
+-// no listen sockets — but the crate must compile).
++// wasm32: WASIX does deliver signals, but only into dispositions the guest
++// registered through libc. wasix-libc keeps a process-wide table and exports
++// __wasm_signal, which dispatches into it; the first install registers that
++// export by name through wasix_32v1.callback_signal
++// (libc-top-half/musl/src/signal/sigaction.c:334). With no install here the
++// table holds only the startup dispositions, so a termination signal takes
++// musl's default action -- terminate_handler, which aborts (sigaction.c:32-36).
++//
++// The `libc` crate exposes no `signal` for this target, so declare the symbol.
++// musl's signal(3) installs with SA_RESTART and an empty mask
++// (src/signal/signal.c:19); the dispatcher then blocks the delivered signal for
++// the handler's duration unless SA_NODEFER (sigaction.c:203), which is the
++// re-entry guard native's sigfillset() mask buys. The handlers below do one
++// atomic store plus SetLatch, so nothing else is needed to stay signal-safe.
+ #[cfg(target_family = "wasm")]
+-fn pqsignal(_signum: i32, _handler: extern "C" fn(i32)) {}
++mod wasix_signal {
++    extern "C" {
++        fn signal(signo: i32, disp: usize) -> usize;
++        fn __SIG_IGN(signo: i32);
++    }
++
++    // musl's SIG_IGN is this no-op function, not the integer 1: the header drops
++    // the magic-value form for this libc because "1 is a valid function pointer
++    // on wasm" (libc-top-half/musl/include/signal.h:285-294). The dispatcher
++    // calls whatever is in the table, so the integer would trap.
++    pub(super) fn sig_ign() -> usize {
++        __SIG_IGN as usize
++    }
++
++    pub(super) fn install(signo: i32, disp: usize) {
++        // SAFETY: `disp` is an `extern "C" fn(i32)` pointer -- a real handler or
++        // __SIG_IGN -- which is the signature the dispatcher calls. The return
++        // value (previous disposition, or SIG_ERR) is not actionable here; the
++        // native install below ignores it the same way.
++        unsafe {
++            signal(signo, disp);
++        }
++    }
++}
++
++#[cfg(target_family = "wasm")]
++fn pqsignal(signum: i32, handler: extern "C" fn(i32)) {
++    wasix_signal::install(signum, handler as usize);
++}
++
++#[cfg(target_family = "wasm")]
++fn pqsignal_ignore(signum: i32) {
++    wasix_signal::install(signum, wasix_signal::sig_ign());
++}
+ 
+ #[cfg(not(target_family = "wasm"))]
+ fn pqsignal(signum: i32, handler: extern "C" fn(i32)) {
+@@ -125,9 +169,6 @@ fn pqsignal(signum: i32, handler: extern "C" fn(i32)) {
+     }
+ }
+ 
+-#[cfg(target_family = "wasm")]
+-fn pqsignal_ignore(_signum: i32) {}
+-
+ #[cfg(not(target_family = "wasm"))]
+ fn pqsignal_ignore(signum: i32) {
+     // SAFETY: SIG_IGN install, no handler code runs.
+diff --git a/crates/backend/postmaster/postmaster/src/serverloop.rs b/crates/backend/postmaster/postmaster/src/serverloop.rs
+index 24cb1e3d23..3abee8ae1d 100644
+--- a/crates/backend/postmaster/postmaster/src/serverloop.rs
++++ b/crates/backend/postmaster/postmaster/src/serverloop.rs
+@@ -248,11 +248,25 @@ pub fn ServerLoop() -> PgResult<i32> {
+             }
+ 
+             if event.events & WL_SOCKET_ACCEPT != 0 {
+-                if let Ok(s) = pqcomm_seams::accept_connection::call(event.fd) {
+-                    let _ = BackendStartup(s);
+-                    // The child thread shares the fd table: the socket is
+-                    // owned by the spawned backend, no postmaster-side close
+-                    // (C closes its fork copy here).
++                // One event, one accept on Linux: the epoll watch is
++                // level-triggered, so a queued connection re-fires. WASIX
++                // coalesces readiness into a single transition event
++                // (lib/wasix os/epoll take_pending_bits), so several
++                // connections can be queued behind one wakeup and only the
++                // first would ever be taken. Drain to the queue's end there;
++                // AcceptConnection's EWOULDBLOCK is the loop's terminator.
++                let mut first_accept = true;
++                while first_accept || cfg!(all(target_family = "wasm", target_vendor = "wasmer")) {
++                    first_accept = false;
++                    match pqcomm_seams::accept_connection::call(event.fd) {
++                        // The child thread shares the fd table: the socket is
++                        // owned by the spawned backend, no postmaster-side
++                        // close (C closes its fork copy here).
++                        Ok(s) => {
++                            let _ = BackendStartup(s);
++                        }
++                        Err(_) => break,
++                    }
+                 }
+             }
+         }
+diff --git a/crates/backend/storage/buffer/bufmgr/src/read.rs b/crates/backend/storage/buffer/bufmgr/src/read.rs
+index 6b02508fbf..b28cffdff6 100644
+--- a/crates/backend/storage/buffer/bufmgr/src/read.rs
++++ b/crates/backend/storage/buffer/bufmgr/src/read.rs
+@@ -650,14 +650,15 @@ fn AbortBufferIO(buffer: Buffer) {
+         debug_assert!(buf_state & BM_DIRTY == 0);
+         UnlockBufHdr(desc, buf_state);
+     } else {
++        // Upstream (bufmgr.c AbortBufferIO) treats a valid — hence dirty —
++        // buffer still in progress at abort time as the *normal* result of the
++        // write path erroring after StartBufferIO, and simply falls through to
++        // TerminateBufferIO. On this unwinding port that error is a panic exit
++        // from FlushBuffer's `ereport`, so reaching here is expected, not an
++        // invariant violation: asserting BM_DIRTY (upstream's debug-only
++        // `Assert`) and cleaning up, rather than aborting the whole postmaster.
++        debug_assert!(buf_state & BM_DIRTY != 0);
+         UnlockBufHdr(desc, buf_state);
+-        // INVARIANT: the only write-side StartBufferIO is FlushBuffer
+-        // (write.rs), and every one of its exits calls TerminateBufferIO
+-        // inline (with forget_owner) before an Err can propagate, so no
+-        // write IO is ever left in progress for abort to clean up. Reaching
+-        // this means a callee panicked between StartBufferIO and
+-        // TerminateBufferIO on the write path.
+-        panic!("AbortBufferIO found a dirty buffer with IO in progress: FlushBuffer terminates every write IO inline (write.rs), so no write path can leak BM_IO_IN_PROGRESS");
+     }
+     TerminateBufferIO(desc, false, BM_IO_ERROR, false, false);
+ }
+diff --git a/crates/backend/storage/ipc/waiter/Cargo.toml b/crates/backend/storage/ipc/waiter/Cargo.toml
+index 76a9561c5e..88efc1135f 100644
+--- a/crates/backend/storage/ipc/waiter/Cargo.toml
++++ b/crates/backend/storage/ipc/waiter/Cargo.toml
+@@ -9,7 +9,11 @@ name = "waiter"
+ path = "src/lib.rs"
+ 
+ [lints.rust]
+-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(pgrust_sim)"] }
++unexpected_cfgs = { level = "warn", check-cfg = [
++    "cfg(loom)",
++    "cfg(pgrust_sim)",
++    'cfg(target_vendor, values("wasmer"))',
++] }
+ 
+ [dependencies]
+ # THE single lock library (permit-s1): mod sync is a facade over it.
+diff --git a/crates/backend/storage/ipc/waiter/src/lib.rs b/crates/backend/storage/ipc/waiter/src/lib.rs
+index fa66c21845..40ce7c1b78 100644
+--- a/crates/backend/storage/ipc/waiter/src/lib.rs
++++ b/crates/backend/storage/ipc/waiter/src/lib.rs
+@@ -595,17 +595,36 @@ mod global {
+ 
+     // -- fd-park mode (epoll/kqueue integration) ------------------------------
+ 
++    /// `pipe(2)` with the C contract (`-1` + errno on failure). The libc crate
++    /// binds it for every target except wasm, where only WASIX's wasi-libc
++    /// implements it and the crate's wasi module (shared with wasip1) declares
++    /// nothing.
++    #[cfg(not(target_family = "wasm"))]
++    unsafe fn raw_pipe(fds: *mut i32) -> i32 {
++        // SAFETY: callers pass a 2-slot array.
++        unsafe { libc::pipe(fds) }
++    }
++
++    #[cfg(all(target_family = "wasm", target_vendor = "wasmer"))]
++    unsafe fn raw_pipe(fds: *mut i32) -> i32 {
++        extern "C" {
++            fn pipe(fds: *mut i32) -> i32;
++        }
++        // SAFETY: callers pass a 2-slot array.
++        unsafe { pipe(fds) }
++    }
++
+     /// Ensure this thread's wake pipe exists; returns the READ end for the
+     /// caller to register in its WaitEventSet. Errors are raw errno.
+     ///
+-    /// wasm32: WASI p1 has no pipe(2); fd-park is native-only until the boot
+-    /// increment lands the WASI waiteventset backend (poll_oneoff/latch-park).
+-    #[cfg(target_family = "wasm")]
++    /// wasm32-wasip1: WASI p1 has no pipe(2); fd-park is native-only until the
++    /// boot increment lands the WASI waiteventset backend (poll_oneoff/latch-park).
++    #[cfg(all(target_family = "wasm", not(target_vendor = "wasmer")))]
+     pub fn ensure_wake_pipe() -> Result<i32, i32> {
+         Err(libc::ENOSYS)
+     }
+ 
+-    #[cfg(not(target_family = "wasm"))]
++    #[cfg(any(not(target_family = "wasm"), target_vendor = "wasmer"))]
+     pub fn ensure_wake_pipe() -> Result<i32, i32> {
+         let idx = try_current_slot().ok_or(libc::EAGAIN)?;
+         let s = slot(idx);
+@@ -615,17 +634,17 @@ mod global {
+         }
+         let mut pipefd = [0i32; 2];
+         // SAFETY: pipe(2) into a 2-slot array.
+-        if unsafe { libc::pipe(pipefd.as_mut_ptr()) } < 0 {
++        if unsafe { raw_pipe(pipefd.as_mut_ptr()) } < 0 {
+             return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+         }
+         for fd in pipefd {
+-            for (cmd, arg) in
+-                [(libc::F_SETFL, libc::O_NONBLOCK), (libc::F_SETFD, libc::FD_CLOEXEC)]
+-            {
++            for (cmd, arg) in [
++                (libc::F_SETFL, libc::O_NONBLOCK),
++                (libc::F_SETFD, libc::FD_CLOEXEC),
++            ] {
+                 // SAFETY: fcntl on fds just created.
+                 if unsafe { libc::fcntl(fd, cmd, arg) } == -1 {
+-                    let errno =
+-                        std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
++                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                     for fd in pipefd {
+                         // SAFETY: closing the fds we just created.
+                         unsafe { libc::close(fd) };
+@@ -653,9 +672,9 @@ mod global {
+     pub fn begin_fd_park() -> bool {
+         let idx = current_slot();
+         let mut g = slot(idx).lock();
+-        // wasm32: no wake pipe can exist (no pipe(2)); "parked" is pure mode
+-        // bookkeeping — the wasm wait backend blocks on time alone.
+-        #[cfg(not(target_family = "wasm"))]
++        // wasm32-wasip1: no wake pipe can exist (no pipe(2)); "parked" is pure
++        // mode bookkeeping — the wasm wait backend blocks on time alone.
++        #[cfg(any(not(target_family = "wasm"), target_vendor = "wasmer"))]
+         debug_assert!(g.wake_wfd >= 0, "fd-park without a wake pipe");
+         match g.mode {
+             Mode::Notified => {
+diff --git a/crates/backend/storage/ipc/waiteventset/Cargo.toml b/crates/backend/storage/ipc/waiteventset/Cargo.toml
+index e98bd2bc40..193e80f998 100644
+--- a/crates/backend/storage/ipc/waiteventset/Cargo.toml
++++ b/crates/backend/storage/ipc/waiteventset/Cargo.toml
+@@ -8,6 +8,9 @@ publish.workspace = true
+ name = "waiteventset"
+ path = "src/lib.rs"
+ 
++[lints.rust]
++unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_vendor, values("wasmer"))'] }
++
+ [dependencies]
+ pg_clock = { path = "../../../../port/pg_clock" }
+ types_core = { path = "../../../../_support/types/types_core" }
+diff --git a/crates/backend/storage/ipc/waiteventset/src/epoll.rs b/crates/backend/storage/ipc/waiteventset/src/epoll.rs
+index a85a43c157..f5d1add031 100644
+--- a/crates/backend/storage/ipc/waiteventset/src/epoll.rs
++++ b/crates/backend/storage/ipc/waiteventset/src/epoll.rs
+@@ -6,6 +6,21 @@ use crate::{drain, elog_error_m, os_error, Latch, PgResult, WaitEvent, WaitEvent
+ use types_core::PGINVALID_SOCKET;
+ use types_storage::waiteventset::{WL_LATCH_SET, WL_POSTMASTER_DEATH};
+ 
++// WASIX: the libc crate's wasi module (shared with wasip1) binds no epoll
++// surface, so the items below are re-declared against wasix-libc.
++#[cfg(all(target_family = "wasm", target_vendor = "wasmer"))]
++use crate::wasm_epoll as libc;
++
++// epoll_ev.u64 is the registered WaitEvent's position, but WASIX's
++// epoll_pwait() restores `data` through a ptr -> fd -> data1 -> u64 priority
++// chain (musl src/linux/epoll.c:93-108): a zero tag is replaced by the watched
++// fd, and events[pos] would index a socket number. Biasing by one keeps the
++// pointer view non-zero; Linux stores the 8 bytes verbatim.
++#[cfg(not(all(target_family = "wasm", target_vendor = "wasmer")))]
++const TAG_BIAS: u64 = 0;
++#[cfg(all(target_family = "wasm", target_vendor = "wasmer"))]
++const TAG_BIAS: u64 = 1;
++
+ pub(crate) struct BackendSet {
+     epoll_fd: i32,
+     ret_events: Vec<libc::epoll_event>,
+@@ -64,7 +79,7 @@ impl BackendSet {
+         let mut epoll_ev = libc::epoll_event {
+             events: mask as u32,
+             // C's data.ptr WaitEvent pointer -> stable position.
+-            u64: event.pos as u64,
++            u64: event.pos as u64 + TAG_BIAS,
+         };
+         let action = if old_events == 0 {
+             libc::EPOLL_CTL_ADD
+@@ -121,7 +136,7 @@ pub(crate) fn wait_block(
+         if returned_events == occurred_events.len() {
+             break;
+         }
+-        let cur_event = &events[epoll_ev.u64 as usize];
++        let cur_event = &events[(epoll_ev.u64 - TAG_BIAS) as usize];
+         let mut out = WaitEvent {
+             pos: cur_event.pos,
+             user_data: cur_event.user_data,
+diff --git a/crates/backend/storage/ipc/waiteventset/src/lib.rs b/crates/backend/storage/ipc/waiteventset/src/lib.rs
+index b100da16b8..e600598c82 100644
+--- a/crates/backend/storage/ipc/waiteventset/src/lib.rs
++++ b/crates/backend/storage/ipc/waiteventset/src/lib.rs
+@@ -27,11 +27,20 @@ mod backend;
+ #[cfg(not(any(target_os = "linux", target_family = "wasm")))]
+ #[path = "kqueue.rs"]
+ mod backend;
+-// wasm32: compile-clean stub; the functional WASI poll_oneoff backend is the
+-// P5 boot increment (docs/design/dst-and-wasm.md §5).
+-#[cfg(target_family = "wasm")]
++// WASIX shares Linux's readiness backend: its wasi-libc carries musl's
++// src/linux/epoll.c over the __wasi_epoll_* calls, and epoll needs no libc-crate
++// declarations beyond what wasm_epoll.rs re-declares (the libc crate's
++// target_os = "wasi" module is shared with wasip1 and lists no epoll surface).
++#[cfg(all(target_family = "wasm", target_vendor = "wasmer"))]
++#[path = "epoll.rs"]
++mod backend;
++// wasm32-wasip1: compile-clean stub; there is no socket or pipe to watch.
++#[cfg(all(target_family = "wasm", not(target_vendor = "wasmer")))]
+ #[path = "wasm_stub.rs"]
+ mod backend;
++// The epoll backend's libc items on this target (the libc crate binds none).
++#[cfg(all(target_family = "wasm", target_vendor = "wasmer"))]
++mod wasm_epoll;
+ 
+ #[cfg(test)]
+ mod tests;
+@@ -117,9 +126,9 @@ pub fn InitializeWaitEventSupport() -> PgResult<()> {
+ 
+     // The waiter wake pipe replaces C's self-pipe (created eagerly here to
+     // keep the per-backend fd accounting where it always was).
+-    // wasm32: no pipe(2) on WASI; the wasm backend blocks on time alone
+-    // (single thread — no cross-thread wakes exist to route).
+-    #[cfg(not(target_family = "wasm"))]
++    // wasm32-wasip1: no pipe(2) on WASI; the stub backend blocks on time alone
++    // (single thread — no cross-thread wakes exist to route). WASIX has both.
++    #[cfg(any(not(target_family = "wasm"), target_vendor = "wasmer"))]
+     {
+         if let Err(errno) = waiter::ensure_wake_pipe() {
+             return Err(Box::new(PgError::new(
+@@ -156,14 +165,14 @@ pub fn WakeupPostmaster() {
+     waiter::unpark_word(POSTMASTER_WAKER.load(Ordering::Acquire));
+ }
+ 
+-#[cfg(not(target_family = "wasm"))]
++#[cfg(any(not(target_family = "wasm"), target_vendor = "wasmer"))]
+ fn wakeup_read_fd() -> i32 {
+     waiter::wake_read_fd()
+ }
+ 
+-// wasm32: no wake pipe exists; latch events carry no fd (the wasm backend
+-// blocks on time alone and the generic loop re-checks latch.is_set).
+-#[cfg(target_family = "wasm")]
++// wasm32-wasip1: no wake pipe exists; latch events carry no fd (the stub
++// backend blocks on time alone and the generic loop re-checks latch.is_set).
++#[cfg(all(target_family = "wasm", not(target_vendor = "wasmer")))]
+ fn wakeup_read_fd() -> i32 {
+     PGINVALID_SOCKET
+ }
+diff --git a/crates/backend/storage/ipc/waiteventset/src/wasm_epoll.rs b/crates/backend/storage/ipc/waiteventset/src/wasm_epoll.rs
+new file mode 100644
+index 0000000000..5c15afa1aa
+--- /dev/null
++++ b/crates/backend/storage/ipc/waiteventset/src/wasm_epoll.rs
+@@ -0,0 +1,72 @@
++// WASIX twin of the epoll slice of `libc` that `epoll.rs` names, imported by
++// that file as `use crate::wasm_epoll as libc;`.
++//
++// The libc crate's `target_os = "wasi"` module is shared with wasip1 and
++// declares no epoll surface (its socket/netdb/epoll bindings live only in
++// `wasi/p2.rs`), so the handful of items the Linux backend uses is re-declared
++// here against wasix-libc, which carries musl's `src/linux/epoll.c` over the
++// `__wasi_epoll_*` syscalls. Values are from wasix-libc's
++// `musl/include/sys/epoll.h` and `headers/public/wasi/api_wasix.h`.
++//
++// `close` and `EINTR` come from the libc crate unchanged: wasix-libc numbers
++// errno with the WASI table (`__errno_values.h`: EINTR = __WASI_ERRNO_INTR =
++// 27, EAGAIN = 6), which is what the libc crate's wasi module declares too.
++#![allow(non_camel_case_types, dead_code)]
++
++use core::ffi::c_int;
++
++// musl's `struct epoll_event` is `__attribute__((__packed__))` only under
++// `#ifdef __x86_64__`, so on wasm32 the union member is aligned to 8: size 16,
++// the data view at offset 8 — exactly this layout.
++//
++// Only the 4-byte pointer view is written back by WASIX's `epoll_pwait` (see
++// the tag bias in `epoll.rs`), so the high half of `u64` keeps whatever the
++// caller's buffer held; `epoll.rs` truncates it with `as usize` on a 32-bit
++// target, and the bias guarantees the low half is the tag.
++#[repr(C)]
++pub struct epoll_event {
++    pub events: u32,
++    pub u64: u64,
++}
++
++pub const EPOLLIN: c_int = 0x001;
++pub const EPOLLOUT: c_int = 0x004;
++pub const EPOLLERR: c_int = 0x008;
++pub const EPOLLHUP: c_int = 0x010;
++pub const EPOLLRDHUP: c_int = 0x2000;
++
++pub const EPOLL_CLOEXEC: c_int = 0x8000; // == O_CLOEXEC; ignored by wasix-libc
++pub const EPOLL_CTL_ADD: c_int = 1;
++pub const EPOLL_CTL_MOD: c_int = 3;
++
++extern "C" {
++    pub fn epoll_create1(flags: c_int) -> c_int;
++    pub fn epoll_wait(
++        epfd: c_int,
++        events: *mut epoll_event,
++        maxevents: c_int,
++        timeout: c_int,
++    ) -> c_int;
++    #[link_name = "epoll_ctl"]
++    fn raw_epoll_ctl(epfd: c_int, op: c_int, fd: c_int, event: *mut epoll_event) -> c_int;
++    fn __errno_location() -> *mut c_int;
++}
++
++/// wasix-libc's `epoll_ctl` returns the raw `__wasi_errno_t` instead of
++/// keeping C's `-1` + `errno` contract, so a failed registration would read
++/// back as success (and a positive errno as an event count). Normalized here.
++///
++/// # Safety
++/// Same contract as `libc::epoll_ctl`.
++pub unsafe fn epoll_ctl(epfd: c_int, op: c_int, fd: c_int, event: *mut epoll_event) -> c_int {
++    // SAFETY: the caller upholds libc::epoll_ctl's fd/pointer contract.
++    let rc = unsafe { raw_epoll_ctl(epfd, op, fd, event) };
++    if rc == 0 {
++        return 0;
++    }
++    // SAFETY: __errno_location(3) always returns a live slot.
++    unsafe { *__errno_location() = rc };
++    -1
++}
++
++pub use ::libc::{close, EINTR};
+diff --git a/crates/common/ip/Cargo.toml b/crates/common/ip/Cargo.toml
+index 7a7f1fc7cf..10cc2cfb55 100644
+--- a/crates/common/ip/Cargo.toml
++++ b/crates/common/ip/Cargo.toml
+@@ -10,3 +10,10 @@ path = "src/lib.rs"
+ 
+ [dependencies]
+ libc = "0.2"
++
++# src/sys.rs keys its WASIX arms on target_vendor = "wasmer" (the
++# wasm32-wasmer-wasi target's vendor); the upstream rustc value list predates
++# that target, so declare it rather than carry an unexpected_cfgs warning in
++# every native/wasip1 build.
++[lints.rust]
++unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_vendor, values("wasmer"))'] }
+diff --git a/crates/common/ip/src/lib.rs b/crates/common/ip/src/lib.rs
+index d8b4304145..150bd735f0 100644
+--- a/crates/common/ip/src/lib.rs
++++ b/crates/common/ip/src/lib.rs
+@@ -7,8 +7,14 @@
+ pub mod sys;
+ 
+ #[cfg(not(target_family = "wasm"))]
+-use std::mem::{size_of, MaybeUninit};
+-#[cfg(not(target_family = "wasm"))]
++use std::mem::size_of;
++
++// "Resolver-capable" = the netdb/sockaddr surface is reachable: every native
++// target, plus wasm32-wasmer-wasi, whose wasi-libc exports getaddrinfo (see
++// crate::sys). Plain wasm32-wasip1 keeps the EAI_FAIL posture below.
++#[cfg(any(not(target_family = "wasm"), target_vendor = "wasmer"))]
++use std::mem::MaybeUninit;
++#[cfg(any(not(target_family = "wasm"), target_vendor = "wasmer"))]
+ use std::ptr;
+ 
+ #[cfg(any(target_os = "macos", target_os = "ios"))]
+@@ -28,10 +34,11 @@ const SOCKADDR_STORAGE_SIZE: usize = size_of::<libc::sockaddr_storage>();
+ #[cfg(target_family = "wasm")]
+ const SOCKADDR_STORAGE_SIZE: usize = 128;
+ 
+-// wasm32: WASI p1 has no resolver and no AF_UNIX sockets; the wasi libc
+-// crate exposes none of the netdb/sockaddr surface. The API keeps its shape
+-// and every resolution fails with EAI_FAIL (musl value) — pqcomm/backend
+-// callers treat that as "client address unknown", exactly the C failure arm.
++// wasm32: pg_getnameinfo_all stays stubbed on both wasm arms (see its body),
++// and on wasm32-wasip1 — where the wasi libc crate exposes none of the
++// netdb/sockaddr surface — every resolution fails with EAI_FAIL (musl value);
++// pqcomm/backend callers treat that as "client address unknown", exactly the
++// C failure arm.
+ #[cfg(target_family = "wasm")]
+ mod wasm_netdb {
+     pub const EAI_FAIL: i32 = -4;
+@@ -69,7 +76,7 @@ pub struct PgAddrInfo {
+ }
+ 
+ // Resolved addresses replace `result`'s contents (C zeroes *result first).
+-#[cfg(target_family = "wasm")]
++#[cfg(all(target_family = "wasm", not(target_vendor = "wasmer")))]
+ pub fn pg_getaddrinfo_all(
+     _hostname: Option<&str>,
+     _servname: Option<&str>,
+@@ -80,14 +87,14 @@ pub fn pg_getaddrinfo_all(
+     wasm_netdb::EAI_FAIL
+ }
+ 
+-#[cfg(not(target_family = "wasm"))]
++#[cfg(any(not(target_family = "wasm"), target_vendor = "wasmer"))]
+ pub fn pg_getaddrinfo_all(
+     hostname: Option<&str>,
+     servname: Option<&str>,
+     hint: &AddrInfoHint,
+     result: &mut Vec<PgAddrInfo>,
+ ) -> i32 {
+-    if hint.family == libc::AF_UNIX {
++    if hint.family == sys::AF_UNIX {
+         result.clear();
+         return getaddrinfo_unix(servname.unwrap_or(""), Some(hint), result);
+     }
+@@ -97,18 +104,18 @@ pub fn pg_getaddrinfo_all(
+ // getaddrinfo(host, NULL, NULL, ...) as hba.c:1118 check_hostname calls it:
+ // a NULL hints pointer keeps the platform defaults (glibc adds AI_ADDRCONFIG
+ // and AI_V4MAPPED), which zeroed hints do not.
+-#[cfg(target_family = "wasm")]
++#[cfg(all(target_family = "wasm", not(target_vendor = "wasmer")))]
+ pub fn pg_getaddrinfo_default_hints(_hostname: &str, result: &mut Vec<PgAddrInfo>) -> i32 {
+     result.clear();
+     wasm_netdb::EAI_FAIL
+ }
+ 
+-#[cfg(not(target_family = "wasm"))]
++#[cfg(any(not(target_family = "wasm"), target_vendor = "wasmer"))]
+ pub fn pg_getaddrinfo_default_hints(hostname: &str, result: &mut Vec<PgAddrInfo>) -> i32 {
+     getaddrinfo_inet(Some(hostname), None, None, result)
+ }
+ 
+-#[cfg(not(target_family = "wasm"))]
++#[cfg(any(not(target_family = "wasm"), target_vendor = "wasmer"))]
+ fn getaddrinfo_inet(
+     hostname: Option<&str>,
+     servname: Option<&str>,
+@@ -120,29 +127,29 @@ fn getaddrinfo_inet(
+     let host_c = match hostname {
+         Some(h) if !h.is_empty() => match std::ffi::CString::new(h) {
+             Ok(c) => Some(c),
+-            Err(_) => return libc::EAI_FAIL,
++            Err(_) => return sys::EAI_FAIL,
+         },
+         _ => None,
+     };
+     let serv_c = match servname {
+         Some(s) => match std::ffi::CString::new(s) {
+             Ok(c) => Some(c),
+-            Err(_) => return libc::EAI_FAIL,
++            Err(_) => return sys::EAI_FAIL,
+         },
+         None => None,
+     };
+ 
+-    let mut hints: libc::addrinfo = unsafe { MaybeUninit::zeroed().assume_init() };
++    let mut hints: sys::addrinfo = unsafe { MaybeUninit::zeroed().assume_init() };
+     if let Some(hint) = hint {
+         hints.ai_flags = hint.flags;
+         hints.ai_family = hint.family;
+         hints.ai_socktype = hint.socktype;
+     }
+ 
+-    let mut res: *mut libc::addrinfo = ptr::null_mut();
++    let mut res: *mut sys::addrinfo = ptr::null_mut();
+     // SAFETY: host/serv are NUL-terminated CStrings or NULL; res freed iff rc==0.
+     let rc = unsafe {
+-        libc::getaddrinfo(
++        sys::getaddrinfo(
+             host_c.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
+             serv_c.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
+             hint.map_or(ptr::null(), |_| &hints),
+@@ -161,7 +168,7 @@ fn getaddrinfo_inet(
+         ai = info.ai_next;
+     }
+     // SAFETY: res came from a successful getaddrinfo and is freed exactly once.
+-    unsafe { libc::freeaddrinfo(res) };
++    unsafe { sys::freeaddrinfo(res) };
+ 
+     0
+ }
+@@ -212,6 +219,18 @@ pub fn pg_getnameinfo_all(
+     rc
+ }
+ 
++// WASIX sockets are inet/inet6 only: an AF_UNIX request (the postmaster's
++// Unix-socket listen leg, `local` pg_hba lines) has nothing to resolve to, so
++// it takes C's resolver-failure arm and the caller moves on.
++#[cfg(all(target_family = "wasm", target_vendor = "wasmer"))]
++fn getaddrinfo_unix(
++    _path: &str,
++    _hintsp: Option<&AddrInfoHint>,
++    _result: &mut Vec<PgAddrInfo>,
++) -> i32 {
++    sys::EAI_FAIL
++}
++
+ // C bug parity: only one addrinfo is ever set; AI_CANONNAME unsupported.
+ #[cfg(not(target_family = "wasm"))]
+ fn getaddrinfo_unix(
+@@ -367,8 +386,10 @@ pub fn sockaddr_family(addr: &SockAddr) -> i32 {
+     fam as i32
+ }
+ 
+-// wasm32: musl-layout ss_family — a native-endian u16 at offset 0. Only
+-// all-zero (unknown) addresses exist on wasm, so this reads 0/AF_UNSPEC.
++// wasm32: musl-layout ss_family — a native-endian u16 at offset 0. Read
++// unaligned-by-hand because a &sockaddr_storage reference can be misaligned
++// inside the byte buffer; on wasip1 only all-zero (unknown) addresses exist,
++// so this returns AF_UNSPEC there.
+ #[cfg(target_family = "wasm")]
+ pub fn sockaddr_family(addr: &SockAddr) -> i32 {
+     u16::from_ne_bytes([addr.addr[0], addr.addr[1]]) as i32
+@@ -379,8 +400,8 @@ pub fn sockaddr_is_all_zeros(addr: &SockAddr) -> bool {
+     addr.salen == 0 && addr.addr.iter().all(|&b| b == 0)
+ }
+ 
+-#[cfg(not(target_family = "wasm"))]
+-fn copy_addrinfo(info: &libc::addrinfo) -> PgAddrInfo {
++#[cfg(any(not(target_family = "wasm"), target_vendor = "wasmer"))]
++fn copy_addrinfo(info: &sys::addrinfo) -> PgAddrInfo {
+     let mut sa = SockAddr::zeroed();
+     if !info.ai_addr.is_null() && (info.ai_addrlen as usize) <= sa.addr.len() {
+         // SAFETY: ai_addr holds ai_addrlen valid bytes, bounded by the dest.
+diff --git a/crates/common/ip/src/sys.rs b/crates/common/ip/src/sys.rs
+index 15400a922d..31f721ec14 100644
+--- a/crates/common/ip/src/sys.rs
++++ b/crates/common/ip/src/sys.rs
+@@ -1,43 +1,77 @@
+-//! libc socket/netdb surface indirection for the wasm32 arm.
++//! libc socket/netdb surface indirection for the wasm32 arms.
+ //!
+ //! native: verbatim re-exports of the platform libc crate's items — callers
+ //! (`pqcomm`, `hba`) compile to exactly the code they compiled to before.
+ //!
+-//! wasm32: WASI p1 has no server-socket surface (no socket/bind/listen, no
+-//! resolver, no AF_UNIX) and the wasi libc crate exposes none of these
+-//! names. Constants take musl's values (matching the linked wasi-libc's
+-//! numbering convention), types are musl-layout twins (only zeroed, copied,
+-//! and size-of'd on this target), and every call stub fails with ENOSYS.
++//! wasm32-wasip1: WASI p1 has no server-socket surface (no socket/bind/listen,
++//! no resolver, no AF_UNIX) and the wasi libc crate exposes none of these
++//! names. Constants take the linked libc's values (see wasm_net below), types
++//! are its layout twins (only zeroed, copied, and size-of'd on this target),
++//! and every call stub fails with ENOSYS.
+ //! The doc §2.4 transport byte seam is the structural fix; W0 --single never
+ //! listens or accepts, so these stubs are boot-unreachable on wasm.
++//!
++//! wasm32-wasmer-wasi (WASIX): the linked wasi-libc *does* provide the BSD
++//! socket and netdb surface — `llvm-nm --defined-only` on the sysroot's
++//! `lib/rustlib/wasm32-wasmer-wasi/lib/self-contained/libc.a` shows
++//! `socket`, `bind`, `listen`, `accept`, `setsockopt`, `getsockopt`,
++//! `getsockname`, `getaddrinfo` and `freeaddrinfo` all defined (they lower to
++//! the `wasix_32v1` `sock_*` calls). What is missing is only the Rust-side
++//! declaration: the `libc` crate's `target_os = "wasi"` module declares no
++//! socket/netdb item at all, because that module is shared with wasip1. So
++//! the externs are declared here, against the same ABI the constants and type
++//! twins below mirror — wasix-libc's, which is musl-derived but NOT
++//! musl-valued for the address families.
++//!
++//! AF_UNIX is the one surface left stubbed on WASIX: it has no WASIX call
++//! (WASIX sockets are inet/inet6), so `chown`/`getgrnam` — reachable only
++//! through `Setup_AF_UNIX` — keep the ENOSYS posture.
+ 
+ #[cfg(not(target_family = "wasm"))]
+ pub use libc::{
+-    accept, bind, chown, gai_strerror, getgrnam, getsockname, getsockopt, group, listen,
+-    sa_family_t, setsockopt, sockaddr, sockaddr_in, sockaddr_in6, sockaddr_un, socket, socklen_t,
+-    AF_INET, AF_INET6, AF_UNIX, AF_UNSPEC, AI_NUMERICHOST, AI_PASSIVE, EAI_NONAME, IPPROTO_IPV6,
+-    IPPROTO_TCP, IPV6_V6ONLY, NI_NAMEREQD, NI_NUMERICHOST, NI_NUMERICSERV, SOCK_STREAM, SOL_SOCKET, SO_KEEPALIVE,
+-    SO_REUSEADDR, TCP_KEEPCNT, TCP_KEEPINTVL, TCP_NODELAY,
++    accept, addrinfo, bind, chown, freeaddrinfo, gai_strerror, getaddrinfo, getgrnam, getsockname,
++    getsockopt, group, listen, sa_family_t, setsockopt, sockaddr, sockaddr_in, sockaddr_in6,
++    sockaddr_un, socket, socklen_t, AF_INET, AF_INET6, AF_UNIX, AF_UNSPEC, AI_NUMERICHOST,
++    AI_PASSIVE, EAI_FAIL, EAI_NONAME, IPPROTO_IPV6, IPPROTO_TCP, IPV6_V6ONLY, NI_NAMEREQD,
++    NI_NUMERICHOST, NI_NUMERICSERV, SOCK_STREAM, SOL_SOCKET, SO_KEEPALIVE, SO_REUSEADDR,
++    TCP_KEEPCNT, TCP_KEEPINTVL, TCP_NODELAY,
+ };
+ // macOS spells the idle-probe option TCP_KEEPALIVE; consumers cfg that arm
+ // themselves (pqcomm PG_TCP_KEEPALIVE_IDLE), so only re-export where it exists.
+ #[cfg(not(any(target_family = "wasm", target_os = "macos", target_os = "ios")))]
+ pub use libc::TCP_KEEPIDLE;
+ 
++// Shared by both wasm arms: constants and structs in the linked libc's own
++// spelling. Values are checked against wasix-libc's wasm32 headers, NOT the
++// generic musl ones (which are superseded for this target):
++//   libc-bottom-half/headers/public/__header_sys_socket.h -> AF_*, SOCK_STREAM,
++//     SOL_SOCKET, SO_* (each an alias for a __WASI_* enumerator in
++//     libc-bottom-half/headers/public/wasi/api_wasix.h: INET4 1, INET6 2,
++//     UNIX 3, SOCK_OPTION_REUSE_ADDR 2, _KEEP_ALIVE 12, SOL_SOCKET 0x7fffffff)
++//   libc-bottom-half/headers/public/__header_netinet_in.h -> IPPROTO_TCP 6,
++//     IPPROTO_IPV6 41, IPV6_V6ONLY 26, TCP_NODELAY 1, TCP_KEEPIDLE 4
++//   libc-top-half/musl/include/netdb.h -> AI_*, NI_*, EAI_*
++// Two of those families are load-bearing beyond the numbers: wasix numbers
++// AF_INET as 1 (musl says 2), so a Linux table makes getaddrinfo's own IPv4
++// result look like an AF_UNIX address, and setsockopt rewrites only
++// (IPPROTO_IPV6,IPV6_V6ONLY) and (IPPROTO_TCP,TCP_NODELAY) into SOL_SOCKET
++// (cloudlibc/src/libc/sys/socket/setsockopt.c) and answers ENOSYS for anything
++// else, so TCP_KEEPIDLE/KEEPINTVL/KEEPCNT are declared-but-unsupported here.
++// The wasip1 stubs never consult these values, so the sharing is safe; only
++// the WASIX lane can observe a wrong one.
+ #[cfg(target_family = "wasm")]
+-mod wasm_sys {
++mod wasm_net {
+     #![allow(non_camel_case_types)]
+-    use core::ffi::{c_char, c_int, c_void};
++    use core::ffi::{c_char, c_int};
+ 
+-    // musl socket.h / netinet / netdb values.
+     pub const AF_UNSPEC: c_int = 0;
+-    pub const AF_UNIX: c_int = 1;
+-    pub const AF_INET: c_int = 2;
+-    pub const AF_INET6: c_int = 10;
++    pub const AF_UNIX: c_int = 3;
++    pub const AF_INET: c_int = 1;
++    pub const AF_INET6: c_int = 2;
+     pub const SOCK_STREAM: c_int = 1;
+-    pub const SOL_SOCKET: c_int = 1;
++    pub const SOL_SOCKET: c_int = 0x7fff_ffff;
+     pub const SO_REUSEADDR: c_int = 2;
+-    pub const SO_KEEPALIVE: c_int = 9;
++    pub const SO_KEEPALIVE: c_int = 12;
+     pub const IPPROTO_TCP: c_int = 6;
+     pub const IPPROTO_IPV6: c_int = 41;
+     pub const IPV6_V6ONLY: c_int = 26;
+@@ -51,6 +85,7 @@ mod wasm_sys {
+     pub const NI_NUMERICSERV: c_int = 0x02;
+     pub const NI_NAMEREQD: c_int = 0x08;
+     pub const EAI_NONAME: c_int = -2;
++    pub const EAI_FAIL: c_int = -4;
+ 
+     pub type sa_family_t = u16;
+     pub type socklen_t = u32;
+@@ -92,6 +127,13 @@ mod wasm_sys {
+     pub struct group {
+         pub gr_gid: u32,
+     }
++}
++
++// wasip1 (and any other wasm32 without a socket ABI): every call stub fails.
++#[cfg(all(target_family = "wasm", not(target_vendor = "wasmer")))]
++mod wasm_sys {
++    use super::wasm_net::*;
++    use core::ffi::{c_char, c_int, c_void};
+ 
+     // wasi-libc keeps musl's __errno_location; the libc crate binds ENOSYS
+     // with WASI's own numbering, which is what wasi-libc reports too.
+@@ -170,5 +212,86 @@ mod wasm_sys {
+     }
+ }
+ 
++// WASIX (wasm32-wasmer-wasi): the sysroot's wasi-libc exports the real BSD
++// socket + netdb surface, so these are declarations, not stubs. Signatures are
++// musl's; the ABI twins above are the same ones wasip1 already carries.
++#[cfg(all(target_family = "wasm", target_vendor = "wasmer"))]
++mod wasix_sys {
++    use super::wasm_net::*;
++    use core::ffi::{c_char, c_int, c_void};
++
++    // musl netdb.h, in field order.
++    #[repr(C)]
++    pub struct addrinfo {
++        pub ai_flags: c_int,
++        pub ai_family: c_int,
++        pub ai_socktype: c_int,
++        pub ai_protocol: c_int,
++        pub ai_addrlen: socklen_t,
++        pub ai_addr: *mut sockaddr,
++        pub ai_canonname: *mut c_char,
++        pub ai_next: *mut addrinfo,
++    }
++
++    extern "C" {
++        pub fn socket(domain: c_int, ty: c_int, protocol: c_int) -> c_int;
++        pub fn bind(fd: c_int, addr: *const sockaddr, len: socklen_t) -> c_int;
++        pub fn listen(fd: c_int, backlog: c_int) -> c_int;
++        pub fn accept(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) -> c_int;
++        pub fn setsockopt(
++            fd: c_int,
++            level: c_int,
++            name: c_int,
++            value: *const c_void,
++            len: socklen_t,
++        ) -> c_int;
++        pub fn getsockopt(
++            fd: c_int,
++            level: c_int,
++            name: c_int,
++            value: *mut c_void,
++            len: *mut socklen_t,
++        ) -> c_int;
++        pub fn getsockname(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) -> c_int;
++        pub fn getaddrinfo(
++            host: *const c_char,
++            serv: *const c_char,
++            hints: *const addrinfo,
++            res: *mut *mut addrinfo,
++        ) -> c_int;
++        pub fn freeaddrinfo(res: *mut addrinfo);
++        pub fn gai_strerror(err: c_int) -> *const c_char;
++    }
++
++    extern "C" {
++        fn __errno_location() -> *mut c_int;
++    }
++    unsafe fn enosys() -> c_int {
++        unsafe { *__errno_location() = libc::ENOSYS };
++        -1
++    }
++
++    /// # Safety
++    /// No-op stub; never dereferences its arguments. WASIX sockets are
++    /// inet/inet6 only, so AF_UNIX's file-ownership path stays unreachable.
++    pub unsafe fn chown(_path: *const c_char, _uid: u32, _gid: u32) -> c_int {
++        unsafe { enosys() }
++    }
++    /// # Safety
++    /// No-op stub; never dereferences its arguments. NULL = "no such group".
++    pub unsafe fn getgrnam(_name: *const c_char) -> *mut group {
++        unsafe {
++            *__errno_location() = libc::ENOSYS;
++        }
++        core::ptr::null_mut()
++    }
++}
++
++// The musl twins are part of the surface callers use (`sys::sockaddr`,
++// `sys::socklen_t`, `sys::AF_INET`), so they are re-exported on every wasm arm.
++#[cfg(all(target_family = "wasm", target_vendor = "wasmer"))]
++pub use wasix_sys::*;
+ #[cfg(target_family = "wasm")]
++pub use wasm_net::*;
++#[cfg(all(target_family = "wasm", not(target_vendor = "wasmer")))]
+ pub use wasm_sys::*;
+diff --git a/crates/port/pg_clock/Cargo.toml b/crates/port/pg_clock/Cargo.toml
+index d94325a9e9..dc02b94a78 100644
+--- a/crates/port/pg_clock/Cargo.toml
++++ b/crates/port/pg_clock/Cargo.toml
+@@ -15,7 +15,10 @@ libc = "0.2"
+ # VFS dispatch mechanism verbatim). It is set exclusively by the sim harness's
+ # RUSTFLAGS — never in .cargo/config, any product profile, or CI cluster submit envs.
+ [lints.rust]
+-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(pgrust_sim)', 'cfg(loom)'] }
++# `target_vendor = "wasmer"` is set by the wasm32-wasmer-wasi target (the WASIX
++# lane's build target) and is missing from rustc's known-value list; posix.rs
++# keys the clockid ABI on it.
++unexpected_cfgs = { level = "warn", check-cfg = ['cfg(pgrust_sim)', 'cfg(loom)', 'cfg(target_vendor, values("wasmer"))'] }
+ 
+ [features]
+ # stub:clock monotonic half (fuzz/STUBS.md) — a fuzz-only ENVIRONMENT pin:
+diff --git a/crates/port/pg_clock/src/posix.rs b/crates/port/pg_clock/src/posix.rs
+index 0d49a23f35..44195e1cd3 100644
+--- a/crates/port/pg_clock/src/posix.rs
++++ b/crates/port/pg_clock/src/posix.rs
+@@ -5,10 +5,54 @@
+ //!
+ //! Errno-analog rule: never panics. A failed `clock_gettime` leaves the
+ //! zeroed timespec and the read reports 0 — exactly the retired waiter
+-//! `RealClock` behavior.
++//! `RealClock` behavior. That masking is why the WASIX clockid ABI mismatch
++//! below read as "the clock is stuck at the epoch" instead of an error.
+ 
+ use crate::ClockSource;
+ 
++/// The `clockid_t` constants + the `clock_gettime` import, declared against the
++/// libc this target actually links.
++mod abi {
++    #[cfg(not(target_vendor = "wasmer"))]
++    pub type ClockId = libc::clockid_t;
++    #[cfg(not(target_vendor = "wasmer"))]
++    pub const MONOTONIC: ClockId = libc::CLOCK_MONOTONIC;
++    #[cfg(not(target_vendor = "wasmer"))]
++    pub const REALTIME: ClockId = libc::CLOCK_REALTIME;
++
++    /// wasix-libc is a musl fork: its `clockid_t` is a plain int holding the raw
++    /// WASI clock id (`__header_time.h` defines `CLOCK_MONOTONIC` as
++    /// `__WASI_CLOCKID_MONOTONIC`), not wasi-libc's pointer to an opaque
++    /// `__clockid`. The `libc` crate applies the wasi-libc shape to every
++    /// `target_os = "wasi"` build — `clockid_t(*const u8)` with
++    /// `CLOCK_MONOTONIC = addr_of!(_CLOCK_MONOTONIC)` — and `wasm32-wasmer-wasi`
++    /// reports that `target_os`, so through `libc` a data address reaches a host
++    /// that wants 0 or 1. It answers EINVAL and, since the error path never
++    /// writes the caller's timespec, both clocks then read 0.
++    #[cfg(target_vendor = "wasmer")]
++    pub type ClockId = libc::c_int;
++    #[cfg(target_vendor = "wasmer")]
++    pub const MONOTONIC: ClockId = 1; // __WASI_CLOCKID_MONOTONIC
++    #[cfg(target_vendor = "wasmer")]
++    pub const REALTIME: ClockId = 0; // __WASI_CLOCKID_REALTIME
++
++    #[cfg(target_vendor = "wasmer")]
++    extern "C" {
++        fn clock_gettime(clock_id: ClockId, tp: *mut libc::timespec) -> libc::c_int;
++    }
++
++    /// # Safety
++    /// `ts` must point at a live `timespec` for the duration of the call.
++    #[inline]
++    pub unsafe fn get(clock: ClockId, ts: *mut libc::timespec) -> libc::c_int {
++        #[cfg(not(target_vendor = "wasmer"))]
++        let rc = unsafe { libc::clock_gettime(clock, ts) };
++        #[cfg(target_vendor = "wasmer")]
++        let rc = unsafe { clock_gettime(clock, ts) };
++        rc
++    }
++}
++
+ /// Zero-sized product clock. `ActiveClock` in every non-`pgrust_sim` build.
+ #[derive(Clone, Copy, Debug, Default)]
+ pub struct PosixClock;
+@@ -21,23 +65,23 @@ impl PosixClock {
+ }
+ 
+ #[inline]
+-fn read_clock_ns(clock: libc::clockid_t) -> i64 {
++fn read_clock_ns(clock: abi::ClockId) -> i64 {
+     // SAFETY: clock_gettime into a zeroed timespec; on failure the zeroed
+     // timespec reads as 0 (never-panic rule).
+     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+     // SAFETY: valid pointer to ts.
+-    unsafe { libc::clock_gettime(clock, &mut ts) };
++    unsafe { abi::get(clock, &mut ts) };
+     ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
+ }
+ 
+ impl ClockSource for PosixClock {
+     #[inline]
+     fn mono_ns(&self) -> u64 {
+-        read_clock_ns(libc::CLOCK_MONOTONIC).max(0) as u64
++        read_clock_ns(abi::MONOTONIC).max(0) as u64
+     }
+ 
+     #[inline]
+     fn wall_ns(&self) -> i64 {
+-        read_clock_ns(libc::CLOCK_REALTIME)
++        read_clock_ns(abi::REALTIME)
+     }
+ }
